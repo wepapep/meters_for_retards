@@ -12,7 +12,7 @@ returns a complete HDLC frame including both opening and closing flags.
 import socket
 from abc import ABC, abstractmethod
 
-from hdlc import HDLC_FLAG
+from .hdlc import HDLC_FLAG
 
 
 class TransportError(Exception):

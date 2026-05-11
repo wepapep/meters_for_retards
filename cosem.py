@@ -1,112 +1,188 @@
 """
 cosem.py — COSEM (Companion Specification for Energy Metering) layer.
 
-Builds the xDLMS/COSEM PDUs that sit inside HDLC I-frame info fields:
-  - AARQ (association request)  / AARE (association response)
-  - GET.request                  / GET.response
-  - RLRQ (release request)       / RLRE (release response) — later
+Builds the xDLMS/COSEM PDUs that sit inside HDLC I-frame info fields.
 
-The public-client, no-auth profile is targeted, matching the observed
-Landis+Gyr capture.
+Supports:
+  - AARQ / AARE   — association setup
+      * Logical Name (LN) referencing — modern meters
+      * Short Name (SN) referencing   — older meters (incl. L+G ZMD)
+      * Authentication: None / Low Level Security (password) / High Level Security
+  - GET.request   — LN style (class_id + obis + attribute)
+  - GET.response  — parsing for both LN and SN responses
+  - SN GET-style read (READ.request, used by SN meters)
+  - RLRQ          — graceful release
+
+Reference: DLMS Green Book Edition 9, sections 9 & 10.
 """
 
+from __future__ import annotations
+
 import struct
+from dataclasses import dataclass
+from enum import IntEnum
 
 
-# ---------------------------------------------------------------------------
-# AARQ / AARE
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Constants
+# ===========================================================================
 
-# Application context OID: 2.16.756.5.8.1.2  →  BER-encoded
-# = LN referencing, no ciphering
-# Kept as raw bytes since only this one is used with the public client.
-_APP_CONTEXT_OID_LN_NO_CIPHER = bytes([
-    0x06, 0x07, 0x60, 0x85, 0x74, 0x05, 0x08, 0x01, 0x02
-])
+# Referencing styles — what the application context OID encodes
+class Referencing(IntEnum):
+    LN = 0   # Logical Name (6-byte OBIS)
+    SN = 1   # Short Name (2-byte object code)
 
-# Conformance bitstring: which DLMS services the client advertises as supported.
-# 00 1C 13 20 matches the observed L+G client — includes get, set, action,
-# selective-access, and block-transfer-for-get.
-_CONFORMANCE_BLOCK = bytes([0x5F, 0x04, 0x00, 0x1C, 0x13, 0x20])
 
+# Authentication mechanisms (mechanism-id values)
+class AuthMech(IntEnum):
+    NONE = 0          # public client, no auth
+    LOW  = 1          # LLS — password sent in plaintext
+    HIGH = 2          # HLS — generic challenge-response (vendor-specific)
+    HIGH_MD5  = 3
+    HIGH_SHA1 = 4
+    HIGH_GMAC = 5
+    HIGH_SHA256 = 6
+    HIGH_ECDSA  = 7
+
+
+# Application context OIDs (last byte distinguishes them)
+# Base: 2.16.756.5.8.1.X  →  06 07 60 85 74 05 08 01 XX
+_OID_PREFIX = bytes([0x06, 0x07, 0x60, 0x85, 0x74, 0x05, 0x08, 0x01])
+
+_OID_SUFFIX = {
+    (Referencing.LN, False): 0x01,   # LN, no ciphering
+    (Referencing.LN, True):  0x03,   # LN, ciphered
+    (Referencing.SN, False): 0x02,   # SN, no ciphering
+    (Referencing.SN, True):  0x04,   # SN, ciphered
+}
+
+
+# Default conformance bitstrings — different services for LN vs SN
+# Conformance is a BIT STRING; the wire format is "5F 04 LL <3 bytes>"
+# where the 3 bytes encode the conformance bits.
+_CONFORMANCE_LN = bytes([0x5F, 0x04, 0x00, 0x00, 0x60, 0x1D])  # get, set, action, selective-access, block-transfer
+_CONFORMANCE_SN = bytes([0x5F, 0x04, 0x00, 0x1C, 0x13, 0x20])  # what L+G uses — matches our captures
+
+
+# Default invoke-id-and-priority byte: priority-high, confirmed, invoke-id=1
+DEFAULT_INVOKE_ID = 0xC1
+
+
+# ===========================================================================
+# AARQ — Association Request
+# ===========================================================================
 
 def build_aarq(
-    max_pdu_size: int = 0,
-    dlms_version: int = 6,
+    referencing:   Referencing = Referencing.SN,
+    auth:          AuthMech    = AuthMech.NONE,
+    password:      bytes | None = None,
+    max_pdu_size:  int = 0,
+    dlms_version:  int = 6,
+    conformance:   bytes | None = None,
 ) -> bytes:
     """
-    Build an AARQ (Association Request) PDU for the public/no-auth client.
+    Build an AARQ PDU.
 
     Args:
-        max_pdu_size: client-max-receive-pdu-size; 0 means "any size accepted".
-        dlms_version: proposed DLMS version (always 6 in practice).
+        referencing:  LN or SN (default SN, matches L+G ZMD)
+        auth:         authentication mechanism (default NONE)
+        password:     for LOW / HIGH auth — the password bytes (LLS) or
+                      the client-to-server challenge (HLS)
+        max_pdu_size: client-max-receive-pdu-size; 0 = "any"
+        dlms_version: always 6 in practice
+        conformance:  override the default conformance block bytes
+                      (full TLV including 5F 04 LL ...)
 
     Returns:
-        Raw AARQ bytes, to be placed in the info field of an I-frame
-        (after the LLC header).
+        Raw AARQ bytes (tag 0x60 ...), ready to put after the LLC header.
     """
-    # xDLMS InitiateRequest (will be wrapped in an OCTET STRING under
-    # user-information)
-    initiate_request = bytes([
-        0x01,  # InitiateRequest tag
-        0x00,  # dedicated-key absent
-        0x00,  # response-allowed-used absent → default TRUE
-        0x00,  # proposed-quality-of-service absent
-        dlms_version,
-    ]) + _CONFORMANCE_BLOCK + struct.pack(">H", max_pdu_size)
+    if auth != AuthMech.NONE and password is None:
+        raise ValueError(f"auth={auth.name} requires a password/challenge")
 
-    # user-information [30] — wraps the InitiateRequest in an OCTET STRING
+    # ---- xDLMS InitiateRequest (will be wrapped in OCTET STRING) ----
+    if conformance is None:
+        conformance = _CONFORMANCE_LN if referencing == Referencing.LN else _CONFORMANCE_SN
+
+    initiate_request = (
+        bytes([
+            0x01,        # InitiateRequest tag
+            0x00,        # dedicated-key absent
+            0x00,        # response-allowed-used absent → default TRUE
+            0x00,        # proposed-quality-of-service absent
+            dlms_version,
+        ])
+        + conformance
+        + struct.pack(">H", max_pdu_size)
+    )
+
     user_info = (
         bytes([0xBE, len(initiate_request) + 2,  # [30] IMPLICIT
-               0x04, len(initiate_request)])     # OCTET STRING tag
+               0x04, len(initiate_request)])     # OCTET STRING tag + length
         + initiate_request
     )
 
-    # protocol-version [0] IMPLICIT BIT STRING (version 1)
+    # ---- protocol-version [0] IMPLICIT BIT STRING ----
     protocol_version = bytes([0x80, 0x02, 0x07, 0x80])
 
-    # application-context-name [1]
-    app_context = bytes([0xA1, len(_APP_CONTEXT_OID_LN_NO_CIPHER)]) + _APP_CONTEXT_OID_LN_NO_CIPHER
+    # ---- application-context-name [1] ----
+    ciphered    = False  # ciphering not implemented
+    oid         = _OID_PREFIX + bytes([_OID_SUFFIX[(referencing, ciphered)]])
+    app_context = bytes([0xA1, len(oid)]) + oid
 
-    body = protocol_version + app_context + user_info
+    # ---- Authentication fields (optional) ----
+    auth_fields = b""
+    if auth != AuthMech.NONE:
+        # sender-acse-requirements [10] — "authentication required" bit
+        auth_fields += bytes([0x8A, 0x02, 0x07, 0x80])
 
-    # AARQ tag 0x60 + length
+        # mechanism-name [11]
+        mech_oid = bytes([0x60, 0x85, 0x74, 0x05, 0x08, 0x02]) + bytes([int(auth)])
+        auth_fields += bytes([0x8B, len(mech_oid)]) + mech_oid
+
+        # calling-authentication-value [12] — GraphicString tag 0x80
+        auth_fields += bytes([0xAC, len(password) + 2, 0x80, len(password)]) + password
+
+    # ---- Assemble ----
+    body = protocol_version + app_context + auth_fields + user_info
     return bytes([0x60, len(body)]) + body
 
 
-def parse_aare(data: bytes) -> dict:
+# ===========================================================================
+# AARE — Association Response
+# ===========================================================================
+
+@dataclass
+class AssociationResult:
+    accepted:              bool
+    result:                int
+    result_source:         int
+    result_diagnostic:     int
+    server_max_pdu:        int | None
+    negotiated_conformance: bytes | None
+    server_challenge:      bytes | None   # for HLS, populated from auth value
+
+
+def parse_aare(data: bytes) -> AssociationResult:
     """
-    Parse an AARE (Association Response) PDU.
+    Parse an AARE PDU.
 
-    Only the fields needed to confirm "association accepted" are extracted.
-    Ciphering/auth fields are ignored since we don't use them.
-
-    Args:
-        data: AARE bytes (tag 0x61 onward).
-
-    Returns:
-        {
-          "result":            int,   # 0 = accepted
-          "result_source":     int,   # 0 = ACSE, 1 = xDLMS
-          "result_diagnostic": int,
-          "server_max_pdu":    int | None,
-          "negotiated_conformance": bytes | None,
-        }
+    Extracts: result code, server max PDU, negotiated conformance, and
+    (for HLS) the server's challenge.
 
     Raises:
-        ValueError: if the data isn't an AARE or is malformed.
+        ValueError: if data isn't an AARE.
     """
     if len(data) < 2 or data[0] != 0x61:
-        raise ValueError(f"Not an AARE (expected tag 0x61, got {data[0]:#04x})")
+        raise ValueError(f"Not an AARE (expected 0x61, got {data[0]:#04x})")
 
-    length = data[1]
-    body   = data[2:2 + length]
+    body = data[2:2 + data[1]]
 
     result = 0
     result_source = 0
     result_diagnostic = 0
     server_max_pdu = None
     negotiated_conformance = None
+    server_challenge = None
 
     i = 0
     while i < len(body):
@@ -114,30 +190,27 @@ def parse_aare(data: bytes) -> dict:
         sub_len = body[i + 1]
         value = body[i + 2:i + 2 + sub_len]
 
-        if tag == 0xA2:  # [2] result
-            # value = 03 02 01 RR  (INTEGER, length 1, value RR)
+        if tag == 0xA2:                          # [2] result
             if len(value) >= 4:
                 result = value[3]
 
-        elif tag == 0xA3:  # [3] result-source-diagnostic
-            # value = XX LL YY LL RR  — nested CHOICE
+        elif tag == 0xA3:                        # [3] result-source-diagnostic
             if len(value) >= 5:
-                result_source     = value[0] & 0x1F  # [0] ACSE / [1] xDLMS
+                result_source     = value[0] & 0x1F
                 result_diagnostic = value[4]
 
-        elif tag == 0xBE:  # [30] user-information
-            # Contains InitiateResponse or ConfirmedServiceError inside an OCTET STRING
+        elif tag == 0xAA:                        # [10] responding-AP-title — HLS challenge
+            # value usually: 80 LL <challenge bytes>
+            if len(value) >= 2 and value[0] == 0x80:
+                server_challenge = value[2:2 + value[1]]
+
+        elif tag == 0xBE:                        # [30] user-information
             if len(value) >= 2 and value[0] == 0x04:
                 inner = value[2:2 + value[1]]
-                if inner and inner[0] == 0x08:  # InitiateResponse tag
-                    # Skip: negotiated-quality-of-service (1 byte, optional)
-                    #       negotiated-dlms-version (1 byte)
-                    #       negotiated-conformance (6 bytes: 5F 04 LL XX XX XX)
-                    #       server-max-receive-pdu-size (2 bytes)
-                    #       VAA-name (2 bytes)
+                if inner and inner[0] == 0x08:  # InitiateResponse
                     j = 1
-                    # optional quality-of-service indicator (0x00 or value)
-                    if j < len(inner) and inner[j] != 0x06:  # if not the dlms-version yet
+                    # optional negotiated-quality-of-service
+                    if j < len(inner) and inner[j] != 0x06:
                         j += 1
                     j += 1  # dlms-version
                     if j + 6 <= len(inner) and inner[j] == 0x5F:
@@ -148,50 +221,52 @@ def parse_aare(data: bytes) -> dict:
 
         i += 2 + sub_len
 
-    return {
-        "result": result,
-        "result_source": result_source,
-        "result_diagnostic": result_diagnostic,
-        "server_max_pdu": server_max_pdu,
-        "negotiated_conformance": negotiated_conformance,
-    }
+    return AssociationResult(
+        accepted=(result == 0),
+        result=result,
+        result_source=result_source,
+        result_diagnostic=result_diagnostic,
+        server_max_pdu=server_max_pdu,
+        negotiated_conformance=negotiated_conformance,
+        server_challenge=server_challenge,
+    )
 
 
-# ---------------------------------------------------------------------------
-# GET.request / GET.response
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# RLRQ — Release Request (graceful disconnect at COSEM level)
+# ===========================================================================
 
-# Invoke-id-and-priority: bit 7 = priority, bit 6 = service-class (1=confirmed),
-# bits 0-3 = invoke-id. 0xC1 = priority-high + confirmed + invoke-id 1.
-DEFAULT_INVOKE_ID = 0xC1
+def build_rlrq() -> bytes:
+    """
+    Build a minimal RLRQ PDU.
+
+    Most meters tolerate not sending this — the HDLC DISC alone closes the
+    session — but it's the polite way to release a COSEM association.
+    """
+    return bytes([0x62, 0x03, 0x80, 0x01, 0x00])
 
 
-def build_get_request_normal(
-    class_id: int,
-    obis: bytes,
-    attribute: int,
-    invoke_id: int = DEFAULT_INVOKE_ID,
+# ===========================================================================
+# GET — Logical Name (LN) referencing
+# ===========================================================================
+
+def build_get_request_ln(
+    class_id:   int,
+    obis:       bytes,
+    attribute:  int = 2,
+    invoke_id:  int = DEFAULT_INVOKE_ID,
 ) -> bytes:
     """
-    Build a GET-Request-Normal PDU to read one attribute of one COSEM object.
+    Build a GET-Request-Normal PDU (LN referencing).
 
-        GET.request  tag = 0xC0
-        · request-type = 0x01 (normal)
-        · invoke-id-and-priority
-        · cosem-attribute-descriptor:
-            class-id              (2 bytes, big-endian)
-            instance-id (OBIS)    (6 bytes)
-            attribute-index       (1 byte, signed)
-            access-selection      (1 byte, 0x00 = none)
-
-    Args:
-        class_id:  COSEM interface class ID (e.g. 1 for "Data").
-        obis:      6-byte OBIS code.
-        attribute: attribute index to read (2 = value for most classes).
-        invoke_id: invoke-id-and-priority byte.
-
-    Returns:
-        Raw GET.request bytes.
+        Layout: C0 01 IP CC CC OO OO OO OO OO OO AA SS
+            C0           GET.request tag
+            01           request-type = normal
+            IP           invoke-id-and-priority
+            CC CC        class-id (big-endian)
+            OO * 6       OBIS code
+            AA           attribute index (signed byte)
+            SS           access-selection (00 = none)
     """
     if len(obis) != 6:
         raise ValueError(f"OBIS must be 6 bytes, got {len(obis)}")
@@ -204,59 +279,98 @@ def build_get_request_normal(
     )
 
 
-def parse_get_response(data: bytes) -> dict:
+# ===========================================================================
+# GET — Short Name (SN) referencing
+# ===========================================================================
+#
+# SN meters use a different service: READ.request (tag 0x05) carrying a
+# variable-access-specification with a 2-byte short-name. This matches
+# what the L+G ZMD captures showed.
+#
+
+def build_read_request_sn(short_name: int, parameter_count_index: int = 0) -> bytes:
     """
-    Parse a GET-Response PDU.
+    Build a READ.request PDU using a single Short Name reference.
 
-    Handles only GET-Response-Normal (the common case). Block-transfer
-    responses can be added later if large data is needed.
+        Layout: 05 01 02 NN NN
+            05       READ.request tag
+            01       count of items (1)
+            02       variable-access tag: "variable-name"
+            NN NN    short-name (16-bit, big-endian)
 
-        GET.response tag = 0xC4
-        · response-type = 0x01 (normal)
-        · invoke-id-and-priority
-        · result: CHOICE
-            [0] data              → raw attribute value
-            [1] data-access-error → 1-byte error code
+    Note: this is equivalent to lg_short.build_read_request(); we keep
+    a copy here so the function lives in the standards-aware layer rather
+    than the vendor module. Vendors can still use this directly.
+    """
+    if not 0 <= short_name <= 0xFFFF:
+        raise ValueError(f"short_name out of range: {short_name:#06x}")
+    return bytes([0x05, 0x01, 0x02]) + short_name.to_bytes(2, "big")
 
-    Args:
-        data: GET.response bytes.
 
-    Returns:
-        {
-          "invoke_id": int,
-          "success":   bool,
-          "data":      bytes | None,   # raw attribute value if success
-          "error":     int   | None,   # data-access-error code if failure
-        }
+# ===========================================================================
+# GET.response parsing
+# ===========================================================================
 
-    Raises:
-        ValueError: on malformed or unsupported responses.
+@dataclass
+class GetResponse:
+    invoke_id: int
+    success:   bool
+    data:      bytes        # raw value bytes if success
+    error:     int | None   # data-access-error code if failure
+
+
+def parse_get_response(data: bytes) -> GetResponse:
+    """
+    Parse a GET-Response-Normal PDU (LN reference).
+
+        Layout: C4 01 IP CHOICE DATA...
+            C4           GET.response tag
+            01           response-type = normal
+            IP           invoke-id-and-priority
+            CHOICE:
+              00 ...   → data (success)
+              01 EE    → data-access-error (1-byte code)
     """
     if len(data) < 4:
         raise ValueError(f"GET.response too short: {data.hex()}")
     if data[0] != 0xC4:
         raise ValueError(f"Not a GET.response (expected 0xC4, got {data[0]:#04x})")
     if data[1] != 0x01:
-        raise ValueError(f"Only GET-Response-Normal (0x01) supported, got {data[1]:#04x}")
+        raise ValueError(f"Only GET-Response-Normal supported, got {data[1]:#04x}")
 
     invoke_id = data[2]
     choice    = data[3]
 
     if choice == 0x00:
-        return {
-            "invoke_id": invoke_id,
-            "success":   True,
-            "data":      data[4:],
-            "error":     None,
-        }
-    elif choice == 0x01:
+        return GetResponse(invoke_id=invoke_id, success=True, data=data[4:], error=None)
+    if choice == 0x01:
         if len(data) < 5:
-            raise ValueError(f"Malformed GET.response error: {data.hex()}")
-        return {
-            "invoke_id": invoke_id,
-            "success":   False,
-            "data":      None,
-            "error":     data[4],
-        }
-    else:
-        raise ValueError(f"Unknown GET.response choice: {choice:#04x}")
+            raise ValueError(f"Malformed error response: {data.hex()}")
+        return GetResponse(invoke_id=invoke_id, success=False, data=b"", error=data[4])
+
+    raise ValueError(f"Unknown GET.response choice: {choice:#04x}")
+
+
+def parse_read_response_sn(data: bytes) -> list:
+    """
+    Parse a READ.response (SN reference) — used by L+G ZMD-style meters.
+
+        Layout: 0C SC ST <data>...
+            0C           READ.response tag
+            SC           count of items
+            ST           status for item (00 = success)
+            <data>...    DLMS-tagged value(s)
+
+    Returns a list of result dicts: [{ "success": bool, "status": int, "data": bytes }, ...]
+    Vendors layer additional parsing on top (e.g. lg_short.parse_read_response).
+    """
+    if len(data) < 3 or data[0] != 0x0C:
+        raise ValueError(f"Not a READ.response (expected 0x0C, got {data[:1].hex()})")
+
+    count = data[1]
+    # The exact framing for count > 1 varies by vendor — keep this generic and
+    # return the body for further per-vendor parsing.
+    return [{
+        "count":  count,
+        "body":   data[2:],
+    }]
