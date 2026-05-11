@@ -13,8 +13,8 @@ The transport is decoupled, so the same MeterConnection works for:
 
 from __future__ import annotations
 
-import hdlc
-from transport import Transport, TcpTransport, UdpTransport, TransportError
+from . import hdlc
+from .transport import Transport, TcpTransport, UdpTransport, TransportError
 
 
 DEFAULT_TIMEOUT = 5.0    # seconds
