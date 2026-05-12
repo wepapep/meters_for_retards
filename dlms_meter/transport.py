@@ -90,95 +90,47 @@ class TcpTransport(Transport):
 
     def recv_frame(self, timeout: float) -> bytes:
         """
-        Read a complete HDLC frame from the socket.
+        Read bytes from the socket until a complete HDLC frame is formed.
 
-        HDLC frames carry their own length in the frame format field, so we
-        don't have to scan for the closing 0x7E flag — which is important
-        because some serial-over-TCP gateways pass 0x7E bytes through raw
-        (without byte stuffing). Scanning for 0x7E as a delimiter would
-        incorrectly truncate frames whose address or payload contains 0x7E.
-
-        Reading strategy:
-          1. Scan byte-by-byte until we find an opening 0x7E flag
-          2. Read the 2-byte frame format field
-          3. Extract the lower 11 bits = total frame length (incl. flags)
-          4. Read the remaining bytes for that frame
-          5. Sanity-check: the last byte should be a 0x7E closing flag
-          6. Validate the FCS
-
-        If validation fails, discard and resume scanning from the next byte.
+        An HDLC frame is delimited by 0x7E flags. We read the opening flag,
+        then continue reading until we see the closing flag.
         """
         if self._sock is None:
             raise TransportError("TCP transport is not open")
 
-        from . import hdlc as _hdlc
-
         self._sock.settimeout(timeout)
-        debug = bytearray()
-
-        def _read_exactly(n: int) -> bytes:
-            """Read exactly n bytes from the socket, or raise."""
-            buf = bytearray()
-            while len(buf) < n:
-                chunk = self._sock.recv(n - len(buf))
-                if not chunk:
-                    raise TransportError(
-                        f"TCP connection closed mid-frame. "
-                        f"All bytes received: {bytes(debug).hex(' ').upper()}"
-                    )
-                buf.extend(chunk)
-                debug.extend(chunk)
-            return bytes(buf)
+        buf = bytearray()
 
         try:
+            # Skip junk until we find the opening flag
             while True:
-                # 1. Find the opening flag
-                first = _read_exactly(1)
-                if first[0] != HDLC_FLAG:
-                    continue  # not a flag; keep scanning
+                b = self._sock.recv(1)
+                if not b:
+                    raise TransportError("TCP connection closed while waiting for frame")
+                if b[0] == HDLC_FLAG:
+                    buf.append(b[0])
+                    break
 
-                # 2. Read the frame format (2 bytes)
-                ff_bytes = _read_exactly(2)
-                ff       = int.from_bytes(ff_bytes, "big")
-
-                # 3. Validate the frame format identifier (top 4 bits = 0xA for type-3)
-                if (ff >> 12) != 0xA:
-                    # Not a valid HDLC frame here. The 0x7E we read might have
-                    # been a stray byte; resume scanning. (We can't reliably
-                    # back up, but the next iteration will pick up where we are.)
-                    continue
-
-                # 4. Extract length and read the rest of the frame
-                # claimed_len = bytes between the opening and closing flags
-                # (i.e. frame format + addresses + control + [HCS] + [info] + FCS)
-                claimed_len = ff & 0x07FF
-                total_len   = claimed_len + 2   # add the two flags
-                remaining   = total_len - 3     # we've already read flag(1) + ff(2)
-                if remaining < 1:
-                    continue  # impossibly short
-
-                tail = _read_exactly(remaining)
-
-                # 5. Last byte must be the closing flag
-                if tail[-1] != HDLC_FLAG:
-                    continue  # malformed; discard
-
-                # 6. Validate FCS
-                full    = bytes([HDLC_FLAG]) + ff_bytes + tail
-                payload = full[1:-3]   # everything between flags except the 2-byte FCS
-                received_fcs = int.from_bytes(full[-3:-1], "little")
-                if _hdlc.fcs16(payload) != received_fcs:
-                    continue   # bad checksum; discard
-
-                return full
-
+            # Read until the closing flag
+            while True:
+                b = self._sock.recv(1)
+                if not b:
+                    raise TransportError("TCP connection closed mid-frame")
+                buf.append(b[0])
+                if b[0] == HDLC_FLAG and len(buf) > 1:
+                    # Some devices send a shared flag between back-to-back frames,
+                    # so if buf is exactly "7E 7E" treat the second as the opener
+                    # of this frame (keep reading).
+                    if len(buf) == 2:
+                        buf = bytearray([HDLC_FLAG])
+                        continue
+                    break
         except socket.timeout as e:
-            raise TransportError(
-                f"TCP recv timeout after {timeout}s. "
-                f"Bytes received so far: {bytes(debug).hex(' ').upper() or '(none)'}"
-            ) from e
+            raise TransportError(f"TCP recv timeout after {timeout}s") from e
         except OSError as e:
             raise TransportError(f"TCP recv failed: {e}") from e
+
+        return bytes(buf)
 
 
 # ---------------------------------------------------------------------------
