@@ -1,3 +1,4 @@
+#2026-05-15
 """
 meter.py — Generic high-level facade for DLMS/COSEM meters over HDLC.
 
@@ -35,6 +36,7 @@ Use read_raw_ln() / read_raw_sn() to get the bytes including the tag.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from . import hdlc, cosem, obis, data_types
@@ -71,24 +73,46 @@ class Meter:
 
     def __init__(
         self,
-        transport:    Transport,
-        serial:       int,
-        umac:         int = 1,
-        referencing:  Referencing = Referencing.LN,
-        auth:         AuthMech    = AuthMech.NONE,
-        password:     bytes | None = None,
-        max_pdu_size: int = 0,
-        timeout:      float = DEFAULT_TIMEOUT,
-        retries:      int   = DEFAULT_RETRIES,
+        transport:         Transport,
+        serial:            int,
+        umac:              int = 1,
+        referencing:       Referencing = Referencing.LN,
+        auth:              AuthMech    = AuthMech.NONE,
+        password:          bytes | None = None,
+        max_pdu_size:      int = 0,
+        timeout:           float = DEFAULT_TIMEOUT,
+        retries:           int   = DEFAULT_RETRIES,
+        inter_frame_delay: float = 0.0,
+        pre_snrm_delay:    float = 0.0,
     ):
-        self._serial       = serial
-        self._referencing  = referencing
-        self._auth         = auth
-        self._password     = password
-        self._max_pdu_size = max_pdu_size
-        self._conn         = MeterConnection(
+        """
+        Args:
+            transport, serial, umac, referencing, auth, password, max_pdu_size:
+                see class docstring.
+            timeout:
+                per-frame receive timeout in seconds (default 5.0).
+            retries:
+                number of attempts for the SNRM handshake (default 3).
+            inter_frame_delay:
+                seconds to wait after sending each I-frame (default 0).
+                Useful for slow meters where the serial bus needs time
+                between successive requests.
+            pre_snrm_delay:
+                seconds to wait after TCP connect, before sending SNRM
+                (default 0). Some serial device servers need a moment to
+                wake up the serial port.
+        """
+        self._serial            = serial
+        self._referencing       = referencing
+        self._auth              = auth
+        self._password          = password
+        self._max_pdu_size      = max_pdu_size
+        self._inter_frame_delay = inter_frame_delay
+        self._pre_snrm_delay    = pre_snrm_delay
+        self._conn              = MeterConnection(
             transport, serial=serial, umac=umac,
             timeout=timeout, retries=retries,
+            pre_snrm_delay=pre_snrm_delay,
         )
         self._ns           = 0
         self._nr           = 0
@@ -282,6 +306,8 @@ class Meter:
         )
         try:
             self._conn.send_frame(frame)
+            if self._inter_frame_delay > 0:
+                time.sleep(self._inter_frame_delay)
             raw = self._conn.recv_frame()
         except (TransportError, MeterConnectionError) as e:
             raise MeterError(f"Frame exchange failed: {e}") from e
