@@ -21,29 +21,69 @@ The expected file layout is a Python module exporting one dict:
   inner value = (object_name, attribute_index, field_type)
 
 
-Default location:  ~/.dlms_meter/catalogues.py
+Search order (load_catalogues() with no argument):
+  1. $DLMS_METER_CATALOGUES environment variable
+  2. catalogues.py next to the dlms_meter package
+  3. ~/.dlms_meter/catalogues.py
 """
 
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
 
-DEFAULT_CATALOGUE_PATH = Path.home() / ".dlms_meter" / "catalogues.py"
+# Search locations for the catalogue file, in priority order.
+# load_catalogues() tries each in turn and uses the first one that exists.
+PACKAGE_DIR        = Path(__file__).resolve().parent
+PACKAGE_CATALOGUES = PACKAGE_DIR / "catalogues.py"
+USER_CATALOGUES    = Path.home() / ".dlms_meter" / "catalogues.py"
+
+# Environment variable that, if set, overrides the search order
+ENV_VAR = "DLMS_METER_CATALOGUES"
 
 # Module-level cache so repeated load_catalogues() calls don't re-import
 _catalogues: dict[str, dict[int, tuple[str, int, str]]] | None = None
+_loaded_from: Path | None = None
+
+
+def _find_catalogue_path() -> Path | None:
+    """
+    Resolve the catalogue path using the priority search order.
+
+    Order:
+      1. $DLMS_METER_CATALOGUES (environment variable)
+      2. <package>/catalogues.py  (next to the dlms_meter package)
+      3. ~/.dlms_meter/catalogues.py  (user home directory)
+
+    Returns None if no path exists.
+    """
+    env_path = os.environ.get(ENV_VAR)
+    if env_path:
+        p = Path(env_path)
+        if p.exists():
+            return p
+
+    for candidate in (PACKAGE_CATALOGUES, USER_CATALOGUES):
+        if candidate.exists():
+            return candidate
+
+    return None
 
 
 def load_catalogues(path: Path | str | None = None) -> dict:
     """
     Load the catalogues from a Python file.
 
+    Search order if no path is given:
+      1. $DLMS_METER_CATALOGUES environment variable
+      2. catalogues.py next to the dlms_meter package
+      3. ~/.dlms_meter/catalogues.py
+
     Args:
-        path: optional path to a catalogues.py file. Defaults to
-              ~/.dlms_meter/catalogues.py.
+        path: optional explicit path to a catalogues.py file.
 
     Returns:
         The CATALOGUES dict.
@@ -52,15 +92,26 @@ def load_catalogues(path: Path | str | None = None) -> dict:
         FileNotFoundError: if no catalogue file is found.
         AttributeError:    if the file doesn't expose a CATALOGUES dict.
     """
-    global _catalogues
+    global _catalogues, _loaded_from
 
-    target = Path(path) if path else DEFAULT_CATALOGUE_PATH
-    if not target.exists():
-        raise FileNotFoundError(
-            f"No catalogue file at {target}. "
-            f"Generate one with `python -m dlms_meter.tools.build_catalogues "
-            f"/path/to/xml_dir/`"
-        )
+    if path is not None:
+        target = Path(path)
+        if not target.exists():
+            raise FileNotFoundError(f"No catalogue file at {target}")
+    else:
+        target = _find_catalogue_path()
+        if target is None:
+            searched = [
+                f"  - ${ENV_VAR} (env var, not set)" if not os.environ.get(ENV_VAR)
+                else f"  - ${ENV_VAR}={os.environ[ENV_VAR]} (does not exist)",
+                f"  - {PACKAGE_CATALOGUES}",
+                f"  - {USER_CATALOGUES}",
+            ]
+            raise FileNotFoundError(
+                "No catalogue file found. Searched:\n"
+                + "\n".join(searched)
+                + "\nGenerate one with: python tools/build_catalogues.py /path/to/xml_dir/"
+            )
 
     spec = importlib.util.spec_from_file_location("dlms_meter_catalogues", target)
     if spec is None or spec.loader is None:
@@ -76,8 +127,14 @@ def load_catalogues(path: Path | str | None = None) -> dict:
             f"step finish correctly?"
         )
 
-    _catalogues = module.CATALOGUES
+    _catalogues  = module.CATALOGUES
+    _loaded_from = target
     return _catalogues
+
+
+def loaded_from() -> Path | None:
+    """Path of the catalogue file currently loaded, or None if not loaded."""
+    return _loaded_from
 
 
 def get_catalogues() -> dict | None:
