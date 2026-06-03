@@ -24,7 +24,7 @@ Main entry points:
 from .meter             import Meter, MeterError, MeterInfo
 from .transport         import Transport, TcpTransport, UdpTransport, TransportError
 from .connection        import MeterConnection, MeterConnectionError
-from .catalogue_loader  import load_catalogues, get_catalogues, get_catalogue
+from .catalogue_loader  import load_catalogues, get_catalogues, get_catalogue, loaded_from
 from .vendors.landis_gyr import LandisGyrMeter, LandisGyrZMD, LandisGyrZMQ
 
 __all__ = [
@@ -32,5 +32,5 @@ __all__ = [
     "Transport", "TcpTransport", "UdpTransport", "TransportError",
     "MeterConnection", "MeterConnectionError",
     "LandisGyrMeter", "LandisGyrZMD", "LandisGyrZMQ",
-    "load_catalogues", "get_catalogues", "get_catalogue",
+    "load_catalogues", "get_catalogues", "get_catalogue", "loaded_from",
 ]
