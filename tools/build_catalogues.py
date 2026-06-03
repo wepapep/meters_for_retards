@@ -128,12 +128,21 @@ def main(argv: list[str]) -> int:
                    help="Directory containing ObjectList_*.xml files")
     p.add_argument("output", type=Path, nargs="?",
                    default=None,
-                   help="Output Python file (default: ~/.dlms_meter/catalogues.py)")
+                   help="Output Python file (default: catalogues.py inside "
+                        "the dlms_meter package directory)")
     args = p.parse_args(argv)
 
     output_path = args.output
     if output_path is None:
-        output_path = Path.home() / ".dlms_meter" / "catalogues.py"
+        # Default: write next to the dlms_meter package, so the loader's
+        # priority search finds it without any extra config.
+        try:
+            import dlms_meter
+            pkg_dir = Path(dlms_meter.__file__).resolve().parent
+            output_path = pkg_dir / "catalogues.py"
+        except ImportError:
+            # Fallback to the user-home location if the package isn't importable
+            output_path = Path.home() / ".dlms_meter" / "catalogues.py"
 
     xml_files = sorted(args.xml_dir.glob("ObjectList_*.xml"))
     if not xml_files:
