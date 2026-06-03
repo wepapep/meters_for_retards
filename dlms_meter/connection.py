@@ -13,8 +13,10 @@ The transport is decoupled, so the same MeterConnection works for:
 
 from __future__ import annotations
 
-import hdlc
-from transport import Transport, TcpTransport, UdpTransport, TransportError
+import time
+
+from . import hdlc
+from .transport import Transport, TcpTransport, UdpTransport, TransportError
 
 
 DEFAULT_TIMEOUT = 5.0    # seconds
@@ -48,14 +50,16 @@ class MeterConnection:
         umac: int = 1,
         timeout: float = DEFAULT_TIMEOUT,
         retries: int = DEFAULT_RETRIES,
+        pre_snrm_delay: float = 0.0,
     ):
-        self._transport = transport
-        self._serial    = serial
-        self._umac      = umac
-        self._timeout   = timeout
-        self._retries   = retries
+        self._transport      = transport
+        self._serial         = serial
+        self._umac           = umac
+        self._timeout        = timeout
+        self._retries        = retries
+        self._pre_snrm_delay = pre_snrm_delay
         self._owns_transport = False  # set by convenience constructors
-        self._connected = False
+        self._connected      = False
 
     # ------------------------------------------------------------------
     # Convenience constructors
@@ -70,10 +74,12 @@ class MeterConnection:
         umac: int = 1,
         timeout: float = DEFAULT_TIMEOUT,
         retries: int = DEFAULT_RETRIES,
+        pre_snrm_delay: float = 0.0,
     ) -> "MeterConnection":
         """Create a MeterConnection with a dedicated TCP transport."""
         t = TcpTransport(host, port)
-        c = cls(t, serial=serial, umac=umac, timeout=timeout, retries=retries)
+        c = cls(t, serial=serial, umac=umac, timeout=timeout, retries=retries,
+                pre_snrm_delay=pre_snrm_delay)
         c._owns_transport = True
         return c
 
@@ -86,10 +92,12 @@ class MeterConnection:
         umac: int = 1,
         timeout: float = DEFAULT_TIMEOUT,
         retries: int = DEFAULT_RETRIES,
+        pre_snrm_delay: float = 0.0,
     ) -> "MeterConnection":
         """Create a MeterConnection with a dedicated UDP transport."""
         t = UdpTransport(host, port)
-        c = cls(t, serial=serial, umac=umac, timeout=timeout, retries=retries)
+        c = cls(t, serial=serial, umac=umac, timeout=timeout, retries=retries,
+                pre_snrm_delay=pre_snrm_delay)
         c._owns_transport = True
         return c
 
@@ -120,6 +128,9 @@ class MeterConnection:
 
         Retries up to `self._retries` times on TransportError.
         """
+        if self._pre_snrm_delay > 0:
+            time.sleep(self._pre_snrm_delay)
+
         snrm = hdlc.build_snrm_frame(self._serial, umac=self._umac)
 
         last_error: Exception | None = None
